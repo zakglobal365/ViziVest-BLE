@@ -1,7 +1,9 @@
 {
-  "name": "wled-usermod-example",
+  "name": "ViziVest-BLE",
   "build": {
     "libArchive": false
   },
-  "dependencies": {}
+  "dependencies": {
+    "h2zero/NimBLE-Arduino": "^2.5.1"
+  }
 }
