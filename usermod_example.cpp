@@ -1,371 +1,215 @@
 #include "wled.h"
+#include "NimBLEDevice.h"
 
-/*
- * Usermods allow you to add own functionality to WLED without touching core source files.
- * See the WLED docs: https://kno.wled.ge/advanced/custom-features/
- *
- * This is an example usermod. It demonstrates:
- *   - persistent settings via addToConfig() / readFromConfig()
- *   - JSON state read/write via addToJsonState() / readFromJsonState()
- *   - MQTT subscribe and message handling (guarded by WLED_DISABLE_MQTT)
- *   - button event handling
- *   - the Usermod Settings page via appendConfigData()
- *
- * To create your own usermod:
- *   1. Click "Use this template" on https://github.com/wled/wled-usermod-example to create your own repo.
- *   2. Rename the class and file to something descriptive.
- *   3. Reference your new repo in platformio_override.ini via custom_usermods.
- *
- * REGISTER_USERMOD() at the bottom self-registers the instance — no other
- * file edits are needed.
- */
+#define VIZIVEST_SERVICE_UUID        "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
+#define VIZIVEST_COMMAND_UUID        "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"
+#define VIZIVEST_STATUS_UUID         "6E400003-B5A3-F393-E0A9-E50E24DCCA9E"
 
-//class name. Use something descriptive and leave the ": public Usermod" part :)
-class MyExampleUsermod : public Usermod {
+class ViziVestBLE : public Usermod
+{
+private:
 
-  private:
+  NimBLEServer* bleServer = nullptr;
+  NimBLECharacteristic* commandCharacteristic = nullptr;
+  NimBLECharacteristic* statusCharacteristic = nullptr;
 
-    // Private class members. You can declare variables and functions only accessible to your usermod here
-    bool enabled = false;
-    bool initDone = false;
-    unsigned long lastTime = 0;
+  bool bleStarted = false;
 
-    // config variables — boot defaults can be set here or inside readFromConfig()
-    bool testBool = false;
-    unsigned long testULong = 42424242;
-    float testFloat = 42.42;
-    String testString = "Forty-Two";
-    uint16_t greatValue = 0;  // example persistent value exposed in JSON state
+  // WLED preset numbers.
+  // We will configure these after the BLE system is working.
+  uint8_t glowPreset   = 1;
+  uint8_t leftPreset   = 2;
+  uint8_t rightPreset  = 3;
+  uint8_t hazardPreset = 4;
 
-    // These config variables have defaults set inside readFromConfig()
-    int testInt;
-    long testLong;
-    int8_t testPins[2];
+  static const char _name[];
 
-    // string that are used multiple time (this will save some flash memory)
-    static const char _name[];
-    static const char _enabled[];
+  void sendStatus(const char* message)
+  {
+    if (!statusCharacteristic) return;
 
+    statusCharacteristic->setValue(message);
+    statusCharacteristic->notify();
+  }
 
-    // any private methods should go here (non-inline method should be defined out of class)
-    void publishMqtt(const char* state, bool retain = false); // example for publishing MQTT message
+  void runPreset(uint8_t preset)
+  {
+    if (preset == 0) return;
 
+    applyPreset(preset, CALL_MODE_DIRECT_CHANGE);
+  }
 
+  void processCommand(String command)
+  {
+    command.trim();
+    command.toUpperCase();
+
+    DEBUG_PRINT(F("ViziVest BLE command: "));
+    DEBUG_PRINTLN(command);
+
+    if (command == "GLOW")
+    {
+      runPreset(glowPreset);
+      sendStatus("GLOW");
+    }
+    else if (command == "LEFT")
+    {
+      runPreset(leftPreset);
+      sendStatus("LEFT");
+    }
+    else if (command == "RIGHT")
+    {
+      runPreset(rightPreset);
+      sendStatus("RIGHT");
+    }
+    else if (command == "HAZARD")
+    {
+      runPreset(hazardPreset);
+      sendStatus("HAZARD");
+    }
+    else if (command == "OFF")
+    {
+      bri = 0;
+      stateUpdated(CALL_MODE_DIRECT_CHANGE);
+      sendStatus("OFF");
+    }
+    else if (command == "PING")
+    {
+      sendStatus("VIZIVEST_OK");
+    }
+    else
+    {
+      sendStatus("UNKNOWN_COMMAND");
+    }
+  }
+
+  class CommandCallbacks : public NimBLECharacteristicCallbacks
+  {
   public:
 
-    // non WLED related methods, may be used for data exchange between usermods (non-inline methods should be defined out of class)
+    ViziVestBLE* parent;
 
-    /**
-     * Enable/Disable the usermod
-     */
-    inline void enable(bool enable) { enabled = enable; }
-
-    /**
-     * Get usermod enabled/disabled state
-     */
-    inline bool isEnabled() { return enabled; }
-
-    // To access this usermod from another usermod, cast the result of UsermodManager::lookup():
-    //   MyExampleUsermod* um = (MyExampleUsermod*) UsermodManager::lookup(USERMOD_ID_MYUSERMOD);
-    // Make sure to assign a unique ID in getId()!
-
-
-    /*
-     * setup() is called once at boot. WiFi is not yet connected at this point.
-     * readFromConfig() is called prior to setup()
-     * You can use it to initialize variables, sensors or similar.
-     */
-    void setup() override {
-      // do your set-up here
-      //Serial.println("Hello from my usermod!");
-      initDone = true;
-    }
-
-
-    /*
-     * connected() is called every time the WiFi is (re)connected
-     * Use it to initialize network interfaces
-     */
-    void connected() override {
-      //Serial.println("Connected to WiFi!");
-    }
-
-
-    /*
-     * loop() is called continuously. Here you can check for events, read sensors, etc.
-     * 
-     * Tips:
-     * 1. You can use "if (WLED_CONNECTED)" to check for a successful network connection.
-     *    Additionally, "if (WLED_MQTT_CONNECTED)" is available to check for a connection to an MQTT broker.
-     * 
-     * 2. Try to avoid using the delay() function. NEVER use delays longer than 10 milliseconds.
-     *    Instead, use a timer check as shown here.
-     */
-    void loop() override {
-      // if usermod is disabled or called during strip updating just exit
-      // NOTE: on very long strips strip.isUpdating() may always return true so update accordingly
-      if (!enabled || strip.isUpdating()) return;
-
-      // do your magic here
-      if (millis() - lastTime > 1000) {
-        //Serial.println("I'm alive!");
-        lastTime = millis();
-      }
-    }
-
-
-    /*
-     * addToJsonInfo() can be used to add custom entries to the /json/info part of the JSON API.
-     * Creating an "u" object allows you to add custom key/value pairs to the Info section of the WLED web UI.
-     * Below it is shown how this could be used for e.g. a light sensor
-     */
-    void addToJsonInfo(JsonObject& root) override
+    CommandCallbacks(ViziVestBLE* p)
     {
-      // if "u" object does not exist yet wee need to create it
-      JsonObject user = root["u"];
-      if (user.isNull()) user = root.createNestedObject("u");
-
-      //this code adds "u":{"ExampleUsermod":[20," lux"]} to the info object
-      //int reading = 20;
-      //JsonArray lightArr = user.createNestedArray(FPSTR(_name))); //name
-      //lightArr.add(reading); //value
-      //lightArr.add(F(" lux")); //unit
-
-      // if you are implementing a sensor usermod, you may publish sensor data
-      //JsonObject sensor = root[F("sensor")];
-      //if (sensor.isNull()) sensor = root.createNestedObject(F("sensor"));
-      //temp = sensor.createNestedArray(F("light"));
-      //temp.add(reading);
-      //temp.add(F("lux"));
+      parent = p;
     }
 
-
-    /*
-     * addToJsonState() adds entries to the /json/state response. Clients can read and write these.
-     * Use this to expose runtime state that should be controllable via the API.
-     * addToJsonState() is NOT called for presets — use addToConfig() for persistent values.
-     */
-    void addToJsonState(JsonObject& root) override
+    void onWrite(
+      NimBLECharacteristic* characteristic,
+      NimBLEConnInfo& connInfo
+    ) override
     {
-      if (!initDone || !enabled) return;  // prevent crash on boot applyPreset()
+      std::string value = characteristic->getValue();
 
-      JsonObject usermod = root[FPSTR(_name)];
-      if (usermod.isNull()) usermod = root.createNestedObject(FPSTR(_name));
+      if (value.length() == 0) return;
 
-      usermod["greatValue"] = greatValue;
+      String command = String(value.c_str());
+
+      parent->processCommand(command);
     }
+  };
 
+  CommandCallbacks* commandCallbacks = nullptr;
 
-    /*
-     * readFromJsonState() receives values a client POSTs to /json/state.
-     * The JSON key nesting matches what addToJsonState() writes — clients send back the same structure.
-     */
-    void readFromJsonState(JsonObject& root) override
-    {
-      if (!initDone) return;  // prevent crash on boot applyPreset()
+public:
 
-      JsonObject usermod = root[FPSTR(_name)];
-      if (!usermod.isNull()) {
-        // getJsonValue copies the value if present and returns true; leaves the variable unchanged if missing
-        getJsonValue(usermod["greatValue"], greatValue);
-      }
-    }
+  void setup() override
+  {
+    if (bleStarted) return;
 
+    DEBUG_PRINTLN(F("Starting ViziVest BLE..."));
 
-    /*
-     * addToConfig() saves settings to cfg.json under the "um" object. WLED calls this whenever settings are saved.
-     * The Usermod Settings page in the UI is generated automatically from the keys you write here.
-     *
-     * Usermod Settings Overview:
-     * - Numeric values are treated as floats in the browser.
-     *   - If the numeric value entered into the browser contains a decimal point, it will be parsed as a C float
-     *     before being returned to the Usermod.  The float data type has only 6-7 decimal digits of precision, and
-     *     doubles are not supported, numbers will be rounded to the nearest float value when being parsed.
-     *     The range accepted by the input field is +/- 1.175494351e-38 to +/- 3.402823466e+38.
-     *   - If the numeric value entered into the browser doesn't contain a decimal point, it will be parsed as a
-     *     C int32_t (range: -2147483648 to 2147483647) before being returned to the usermod.
-     *     Overflows or underflows are truncated to the max/min value for an int32_t, and again truncated to the type
-     *     used in the Usermod when reading the value from ArduinoJson.
-     * - Pin values can be treated differently from an integer value by using the key name "pin"
-     *   - "pin" can contain a single or array of integer values
-     *   - On the Usermod Settings page there is simple checking for pin conflicts and warnings for special pins
-     *     - Red color indicates a conflict.  Yellow color indicates a pin with a warning (e.g. an input-only pin)
-     *   - Tip: use int8_t to store the pin value in the Usermod, so a -1 value (pin not set) can be used
-     *
-     * To force a config write from loop(), call serializeConfig() — but use it sparingly (flash wear,
-     * possible LED stutter). Never call it from a network callback.
-     */
-    void addToConfig(JsonObject& root) override
-    {
-      JsonObject top = root.createNestedObject(FPSTR(_name));
-      top[FPSTR(_enabled)] = enabled;
-      top["great"] = greatValue;
-      top["testBool"] = testBool;
-      top["testInt"] = testInt;
-      top["testLong"] = testLong;
-      top["testULong"] = testULong;
-      top["testFloat"] = testFloat;
-      top["testString"] = testString;
-      JsonArray pinArray = top.createNestedArray("pin");
-      pinArray.add(testPins[0]);
-      pinArray.add(testPins[1]); 
-    }
+    NimBLEDevice::init("VIZIVEST");
 
+    bleServer = NimBLEDevice::createServer();
 
-    /*
-     * readFromConfig() is called before setup() and again after settings are saved.
-     * Return false if any expected keys were missing — WLED will then call addToConfig() to write the defaults.
-     * getJsonValue(src, dest) copies the value if present and returns true; leaves dest unchanged if missing.
-     * getJsonValue(src, dest, default) also assigns a default when the key is absent.
-     */
-    bool readFromConfig(JsonObject& root) override
-    {
-      JsonObject top = root[FPSTR(_name)];
+    NimBLEService* service =
+      bleServer->createService(VIZIVEST_SERVICE_UUID);
 
-      bool configComplete = !top.isNull();
+    commandCharacteristic =
+      service->createCharacteristic(
+        VIZIVEST_COMMAND_UUID,
+        NIMBLE_PROPERTY::WRITE |
+        NIMBLE_PROPERTY::WRITE_NR
+      );
 
-      configComplete &= getJsonValue(top["great"], greatValue);
-      configComplete &= getJsonValue(top["testBool"], testBool);
-      configComplete &= getJsonValue(top["testULong"], testULong);
-      configComplete &= getJsonValue(top["testFloat"], testFloat);
-      configComplete &= getJsonValue(top["testString"], testString);
+    statusCharacteristic =
+      service->createCharacteristic(
+        VIZIVEST_STATUS_UUID,
+        NIMBLE_PROPERTY::READ |
+        NIMBLE_PROPERTY::NOTIFY
+      );
 
-      // A 3-argument getJsonValue() assigns the 3rd argument as a default value if the Json value is missing
-      configComplete &= getJsonValue(top["testInt"], testInt, 42);  
-      configComplete &= getJsonValue(top["testLong"], testLong, -42424242);
+    commandCallbacks = new CommandCallbacks(this);
 
-      // "pin" fields have special handling in settings page (or some_pin as well)
-      configComplete &= getJsonValue(top["pin"][0], testPins[0], -1);
-      configComplete &= getJsonValue(top["pin"][1], testPins[1], -1);
+    commandCharacteristic->setCallbacks(commandCallbacks);
 
-      return configComplete;
-    }
+    statusCharacteristic->setValue("VIZIVEST_READY");
 
+    service->start();
 
-    /*
-     * appendConfigData() is called when the Usermod Settings page renders.
-     * Write JavaScript snippets to settingsScript to add helper text or dropdowns for your config fields.
-     * addInfo('<ModName>:<key>', 1, '<html>') adds a tooltip/label next to the field.
-     * addDropdown / addOption replace a plain text input with a <select>.
-     */
-    void appendConfigData(Print& settingsScript) override
-    {
-      settingsScript.print(F("addInfo('")); settingsScript.print(FPSTR(_name)); settingsScript.print(F(":great',1,'<i>(this is a great config value)</i>');"));
-      settingsScript.print(F("addInfo('")); settingsScript.print(FPSTR(_name)); settingsScript.print(F(":testString',1,'enter any string you want');"));
-      settingsScript.print(F("dd=addDropdown('")); settingsScript.print(FPSTR(_name)); settingsScript.print(F("','testInt');"));
-      settingsScript.print(F("addOption(dd,'Nothing',0);"));
-      settingsScript.print(F("addOption(dd,'Everything',42);"));
-    }
+    NimBLEAdvertising* advertising =
+      NimBLEDevice::getAdvertising();
 
+    advertising->addServiceUUID(VIZIVEST_SERVICE_UUID);
+    advertising->setName("VIZIVEST");
+    advertising->start();
 
-    /*
-     * handleOverlayDraw() is called just before every show() (LED strip update frame) after effects have set the colors.
-     * Use this to blank out some LEDs or set them to a different color regardless of the set effect mode.
-     * Commonly used for custom clocks (Cronixie, 7 segment)
-     */
-    void handleOverlayDraw() override
-    {
-      //strip.setPixelColor(0, RGBW32(0,0,0,0)) // set the first pixel to black
-    }
+    bleStarted = true;
 
+    DEBUG_PRINTLN(F("ViziVest BLE is ready."));
+  }
 
-    /**
-     * handleButton() can be used to override default button behaviour. Returning true
-     * will prevent button working in a default way.
-     * Replicating button.cpp
-     */
-    bool handleButton(uint8_t b) override {
-      yield();
-      // ignore certain button types as they may have other consequences
-      if (!enabled
-       || buttons[b].type == BTN_TYPE_NONE
-       || buttons[b].type == BTN_TYPE_RESERVED
-       || buttons[b].type == BTN_TYPE_PIR_SENSOR
-       || buttons[b].type == BTN_TYPE_ANALOG
-       || buttons[b].type == BTN_TYPE_ANALOG_INVERTED) {
-        return false;
-      }
+  void addToConfig(JsonObject& root) override
+  {
+    JsonObject config =
+      root.createNestedObject(F("ViziVest BLE"));
 
-      bool handled = false;
-      // do your button handling here
-      return handled;
-    }
-  
+    config[F("Glow Preset")] = glowPreset;
+    config[F("Left Preset")] = leftPreset;
+    config[F("Right Preset")] = rightPreset;
+    config[F("Hazard Preset")] = hazardPreset;
+  }
 
-#ifndef WLED_DISABLE_MQTT
-    /**
-     * onMqttMessage() is called when a subscribed MQTT topic receives a message.
-     * topic only contains stripped topic (part after /wled/MAC).
-     * Return true to mark the message handled (prevents other usermods from seeing it).
-     * These methods must be inside a #ifndef WLED_DISABLE_MQTT guard — MQTT support is a compile-time option.
-     * See usermods/multi_relay for a well-structured subscribe-in-connect / handle-in-message example.
-     */
-    bool onMqttMessage(char* topic, char* payload) override {
-      //if (strlen(topic) == 8 && strncmp_P(topic, PSTR("/command"), 8) == 0) {
-      //  String action = payload;
-      //  if (action == "on")     { enabled = true;  return true; }
-      //  if (action == "off")    { enabled = false; return true; }
-      //  if (action == "toggle") { enabled = !enabled; return true; }
-      //}
-      return false;
-    }
+  bool readFromConfig(JsonObject& root) override
+  {
+    JsonObject config =
+      root[F("ViziVest BLE")];
 
-    /**
-     * onMqttConnect() is called when MQTT connection is established.
-     * Subscribe to topics here; mqttDeviceTopic holds the device-specific prefix.
-     */
-    void onMqttConnect(bool sessionPresent) override {
-      //char subuf[64];
-      //if (mqttDeviceTopic[0] != 0) {
-      //  strcpy(subuf, mqttDeviceTopic);
-      //  strcat_P(subuf, PSTR("/command"));
-      //  mqtt->subscribe(subuf, 0);
-      //}
-    }
-#endif
+    if (config.isNull()) return false;
 
+    glowPreset =
+      config[F("Glow Preset")] | glowPreset;
 
-    /**
-     * onStateChanged() is used to detect WLED state change
-     * @mode parameter is CALL_MODE_... parameter used for notifications
-     */
-    void onStateChange(uint8_t mode) override {
-      // do something if WLED state changed (color, brightness, effect, preset, etc)
-    }
+    leftPreset =
+      config[F("Left Preset")] | leftPreset;
 
+    rightPreset =
+      config[F("Right Preset")] | rightPreset;
 
-    /*
-     * getId() allows you to optionally give your usermod a unique ID.
-     * The base class returns USERMOD_ID_UNSPECIFIED, which is correct for most custom usermods.
-     * Override only if you need reliable cross-usermod lookup via UsermodManager::lookup()
-     * and have multiple usermods with the same ID registered simultaneously.
-     */
-    // uint16_t getId() override { return USERMOD_ID_UNSPECIFIED; }
+    hazardPreset =
+      config[F("Hazard Preset")] | hazardPreset;
 
-   //More methods can be added in the future, this example will then be extended.
-   //Your usermod will remain compatible as it does not need to implement all methods from the Usermod base class!
+    return true;
+  }
+
+  void addToJsonInfo(JsonObject& root) override
+  {
+    JsonObject info =
+      root[F("ViziVest BLE")];
+
+    info[F("BLE")] =
+      bleStarted ? "VIZIVEST" : "OFF";
+  }
+
+  uint16_t getId() override
+  {
+    return 0x5642;
+  }
 };
 
+const char ViziVestBLE::_name[] PROGMEM = "ViziVest BLE";
 
-// add more strings here to reduce flash memory usage
-const char MyExampleUsermod::_name[]    PROGMEM = "ExampleUsermod";
-const char MyExampleUsermod::_enabled[] PROGMEM = "enabled";
+static ViziVestBLE viziVestBLE;
 
-
-// implementation of non-inline member methods
-
-void MyExampleUsermod::publishMqtt(const char* state, bool retain)
-{
-#ifndef WLED_DISABLE_MQTT
-  //Check if MQTT Connected, otherwise it will crash the 8266
-  if (WLED_MQTT_CONNECTED) {
-    char subuf[64];
-    strcpy(subuf, mqttDeviceTopic);
-    strcat_P(subuf, PSTR("/example"));
-    mqtt->publish(subuf, 0, retain, state);
-  }
-#endif
-}
-
-static MyExampleUsermod example_usermod;
-REGISTER_USERMOD(example_usermod);
+REGISTER_USERMOD(viziVestBLE);
